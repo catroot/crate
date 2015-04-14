@@ -21,9 +21,10 @@
 
 package io.crate.operation.collect;
 
+import com.google.common.base.Function;
 import com.google.common.base.Optional;
 import com.google.common.collect.ImmutableMap;
-import com.google.common.collect.Iterables;
+import com.google.common.collect.Lists;
 import com.google.common.util.concurrent.FutureCallback;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
@@ -37,6 +38,7 @@ import io.crate.executor.transport.TransportActionProvider;
 import io.crate.metadata.Functions;
 import io.crate.metadata.ReferenceResolver;
 import io.crate.operation.ImplementationSymbolVisitor;
+import io.crate.operation.ThreadPools;
 import io.crate.operation.collect.files.FileCollectInputSymbolVisitor;
 import io.crate.operation.collect.files.FileInputFactory;
 import io.crate.operation.collect.files.FileReadingCollector;
@@ -71,43 +73,53 @@ import java.util.concurrent.ThreadPoolExecutor;
  */
 public abstract class MapSideDataCollectOperation<T extends ResultProvider> implements CollectOperation {
 
-    protected final PlanNodeStreamerVisitor streamerVisitor;
-    private final FileCollectInputSymbolVisitor fileInputSymbolVisitor;
-    private final CollectServiceResolver collectServiceResolver;
-    private final ProjectionToProjectorVisitor projectorVisitor;
-    private final ThreadPoolExecutor executor;
-    private final int poolSize;
-    private static final ESLogger logger = Loggers.getLogger(MapSideDataCollectOperation.class);
+    public static class SimpleShardCollectFuture extends ShardCollectFuture {
 
-    private static class SimpleShardCollectFuture extends ShardCollectFuture {
-
+        private final CollectContextService collectContextService;
+        private final UUID jobId;
         private ListenableFuture<Bucket> upstreamResult;
 
-        public SimpleShardCollectFuture(int numShards, ListenableFuture<Bucket> upstreamResult) {
+        public SimpleShardCollectFuture(int numShards,
+                                        ListenableFuture<Bucket> upstreamResult,
+                                        CollectContextService collectContextService,
+                                        UUID jobId) {
             super(numShards);
             this.upstreamResult = upstreamResult;
+            this.collectContextService = collectContextService;
+            this.jobId = jobId;
+
         }
 
         @Override
-        protected void onAllShardsFinished() {
+        public void onAllShardsFinished() {
             Futures.addCallback(upstreamResult, new FutureCallback<Bucket>() {
                 @Override
                 public void onSuccess(@Nullable Bucket result) {
+                    collectContextService.releaseContext(jobId);
                     set(result);
                 }
 
                 @Override
                 public void onFailure(@Nonnull Throwable t) {
+                    collectContextService.releaseContext(jobId);
                     setException(t);
                 }
             });
         }
     }
 
+    protected final PlanNodeStreamerVisitor streamerVisitor;
     private final IndicesService indicesService;
     protected final EvaluatingNormalizer nodeNormalizer;
     protected final ClusterService clusterService;
     private final ImplementationSymbolVisitor nodeImplementationSymbolVisitor;
+    private final CollectContextService collectContextService;
+    private final FileCollectInputSymbolVisitor fileInputSymbolVisitor;
+    private final CollectServiceResolver collectServiceResolver;
+    private final ProjectionToProjectorVisitor projectorVisitor;
+    private final ThreadPoolExecutor executor;
+    private final int poolSize;
+    private static final ESLogger LOGGER = Loggers.getLogger(MapSideDataCollectOperation.class);
 
     public MapSideDataCollectOperation(ClusterService clusterService,
                                        Settings settings,
@@ -117,11 +129,13 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
                                        IndicesService indicesService,
                                        ThreadPool threadPool,
                                        CollectServiceResolver collectServiceResolver,
-                                       PlanNodeStreamerVisitor streamerVisitor) {
+                                       PlanNodeStreamerVisitor streamerVisitor,
+                                       CollectContextService collectContextService) {
         executor = (ThreadPoolExecutor) threadPool.executor(ThreadPool.Names.SEARCH);
         poolSize = executor.getPoolSize();
         this.clusterService = clusterService;
         this.indicesService = indicesService;
+        this.collectContextService = collectContextService;
         this.nodeNormalizer = new EvaluatingNormalizer(functions, RowGranularity.NODE, referenceResolver);
         this.collectServiceResolver = collectServiceResolver;
         this.nodeImplementationSymbolVisitor = new ImplementationSymbolVisitor(
@@ -157,6 +171,7 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
     public ListenableFuture<Bucket> collect(CollectNode collectNode,
                                             RamAccountingContext ramAccountingContext) {
         assert collectNode.isRouted(); // not routed collect is not handled here
+        assert collectNode.jobId().isPresent() : "no jobId present for collect operation";
         String localNodeId = clusterService.localNode().id();
         if (collectNode.executionNodes().contains(localNodeId)) {
             if (!collectNode.routing().containsShards(localNodeId)) {
@@ -279,36 +294,53 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
             return result;
         }
 
-        final List<CrateCollector> shardCollectors = new ArrayList<>(numShards);
+        assert collectNode.jobId().isPresent() : "jobId must be set on CollectNode";
+        JobCollectContext jobCollectContext = collectContextService.acquireContext(collectNode.jobId().get());
 
+        int jobSearchContextId = collectNode.routing().jobSearchContextIdBase();
         // get shardCollectors from single shards
-        Map<String, Set<Integer>> shardIdMap = collectNode.routing().locations().get(localNodeId);
-        for (Map.Entry<String, Set<Integer>> entry : shardIdMap.entrySet()) {
-            String indexName = entry.getKey();
-            IndexService indexService;
-            try {
-                indexService = indicesService.indexServiceSafe(indexName);
-            } catch (IndexMissingException e) {
-                throw new TableUnknownException(entry.getKey(), e);
-            }
+        final List<CrateCollector> shardCollectors = new ArrayList<>(numShards);
+        for (Map.Entry<String, Map<String, List<Integer>>> nodeEntry : collectNode.routing().locations().entrySet()) {
+            if (nodeEntry.getKey().equals(localNodeId)) {
+                Map<String, List<Integer>> shardIdMap = nodeEntry.getValue();
+                for (Map.Entry<String, List<Integer>> entry : shardIdMap.entrySet()) {
+                    String indexName = entry.getKey();
+                    IndexService indexService;
+                    try {
+                        indexService = indicesService.indexServiceSafe(indexName);
+                    } catch (IndexMissingException e) {
+                        throw new TableUnknownException(entry.getKey(), e);
+                    }
 
-            for (Integer shardId : entry.getValue()) {
-                Injector shardInjector;
-                try {
-                    shardInjector = indexService.shardInjectorSafe(shardId);
-                    ShardCollectService shardCollectService = shardInjector.getInstance(ShardCollectService.class);
-                    CrateCollector collector = shardCollectService.getCollector(
-                            collectNode,
-                            projectorChain
-                    );
-                    shardCollectors.add(collector);
-                } catch (IndexShardMissingException e) {
-                    throw new UnhandledServerException(
-                            String.format(Locale.ENGLISH, "unknown shard id %d on index '%s'",
-                                    shardId, entry.getKey()), e);
-                } catch (Exception e) {
-                    logger.error("Error while getting collector", e);
-                    throw new UnhandledServerException(e);
+                    for (Integer shardId : entry.getValue()) {
+                        jobCollectContext.registerJobContextId(
+                                indexService.shardSafe(shardId).shardId(), jobSearchContextId);
+                        Injector shardInjector;
+                        try {
+                            shardInjector = indexService.shardInjectorSafe(shardId);
+                            ShardCollectService shardCollectService = shardInjector.getInstance(ShardCollectService.class);
+                            CrateCollector collector = shardCollectService.getCollector(
+                                    collectNode,
+                                    projectorChain,
+                                    jobCollectContext,
+                                    jobSearchContextId
+                            );
+                            shardCollectors.add(collector);
+                        } catch (IndexShardMissingException e) {
+                            throw new UnhandledServerException(
+                                    String.format(Locale.ENGLISH, "unknown shard id %d on index '%s'",
+                                            shardId, entry.getKey()), e);
+                        } catch (Exception e) {
+                            LOGGER.error("Error while getting collector", e);
+                            throw new UnhandledServerException(e);
+                        }
+                        jobSearchContextId++;
+                    }
+                }
+            } else if (jobSearchContextId > -1) {
+                // just increase jobSearchContextId by shard size of foreign node(s) indices
+                for (List<Integer> shardIdMap : nodeEntry.getValue().values()) {
+                    jobSearchContextId += shardIdMap.size();
                 }
             }
         }
@@ -323,8 +355,8 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
             result.shardFailure(e);
         }
 
-        if (logger.isTraceEnabled()) {
-            logger.trace("started {} shardCollectors", numShards);
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("started {} shardCollectors", numShards);
         }
 
         return result;
@@ -346,30 +378,23 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
                 }
             });
         } else {
-            int availableThreads = Math.max(poolSize - executor.getActiveCount(), 2);
-            if (availableThreads < shardCollectors.size()) {
-                Iterable<List<CrateCollector>> partition = Iterables.partition(
-                        shardCollectors, shardCollectors.size() / availableThreads);
-                for (final List<CrateCollector> collectors : partition) {
-                    executor.execute(new Runnable() {
+            ThreadPools.runWithAvailableThreads(
+                    executor,
+                    poolSize,
+                    Lists.transform(shardCollectors, new Function<CrateCollector, Runnable>() {
+
+                        @Nullable
                         @Override
-                        public void run() {
-                            for (CrateCollector collector : collectors) {
-                                doCollect(result, collector, ramAccountingContext);
-                            }
+                        public Runnable apply(final CrateCollector input) {
+                            return new Runnable() {
+                                @Override
+                                public void run() {
+                                    doCollect(result, input, ramAccountingContext);
+                                }
+                            };
                         }
-                    });
-                }
-            } else {
-                for (final CrateCollector shardCollector : shardCollectors) {
-                    executor.execute(new Runnable() {
-                        @Override
-                        public void run() {
-                            doCollect(result, shardCollector, ramAccountingContext);
-                        }
-                    });
-                }
-            }
+                    })
+            );
         }
     }
 
@@ -384,8 +409,8 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
         } catch (Exception ex) {
             result.shardFailure(ex);
         }
-        if (logger.isTraceEnabled()) {
-            logger.trace("shard finished collect, {} to go", result.numShards());
+        if (LOGGER.isTraceEnabled()) {
+            LOGGER.trace("shard finished collect, {} to go", result.numShards());
         }
     }
 
@@ -397,9 +422,11 @@ public abstract class MapSideDataCollectOperation<T extends ResultProvider> impl
      * @param collectNode    in case any other properties need to be extracted
      * @return a fancy ShardCollectFuture implementation
      */
-    protected ShardCollectFuture getShardCollectFuture(
-            int numShards, ShardProjectorChain projectorChain, CollectNode collectNode) {
-        return new SimpleShardCollectFuture(numShards, projectorChain.resultProvider().result());
+    protected ShardCollectFuture getShardCollectFuture(int numShards,
+                                                       ShardProjectorChain projectorChain,
+                                                       CollectNode collectNode) {
+        return new SimpleShardCollectFuture(numShards, projectorChain.resultProvider().result(),
+                collectContextService, collectNode.jobId().get());
     }
 
     protected Streamer<?>[] getStreamers(CollectNode node) {

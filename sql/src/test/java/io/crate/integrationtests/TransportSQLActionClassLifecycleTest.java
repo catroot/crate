@@ -25,7 +25,6 @@ import io.crate.Build;
 import io.crate.Version;
 import io.crate.action.sql.SQLActionException;
 import io.crate.action.sql.SQLResponse;
-import io.crate.executor.TaskResult;
 import io.crate.metadata.settings.CrateSettings;
 import io.crate.test.integration.ClassLifecycleIntegrationTest;
 import io.crate.testing.SQLTransportExecutor;
@@ -44,6 +43,7 @@ import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.TreeMap;
 
 import static io.crate.testing.TestingHelpers.mapToSortedString;
 import static org.hamcrest.Matchers.*;
@@ -91,14 +91,6 @@ public class TransportSQLActionClassLifecycleTest extends ClassLifecycleIntegrat
         }
     }
 
-
-    @Test
-    public void testRefreshSystemTable() throws Exception {
-        SQLResponse response = executor.exec("refresh table sys.shards");
-        assertFalse(response.hasRowCount());
-        assertThat(response.rows(), is(TaskResult.EMPTY_OBJS));
-    }
-
     @Test
     public void testSelectNonExistentGlobalExpression() throws Exception {
         expectedException.expect(SQLActionException.class);
@@ -122,9 +114,11 @@ public class TransportSQLActionClassLifecycleTest extends ClassLifecycleIntegrat
     public void testSelectDoc() throws Exception {
         SQLResponse response = executor.exec("select _doc from characters order by name desc limit 1");
         assertArrayEquals(new String[]{"_doc"}, response.cols());
-
-        assertThat(mapToSortedString((Map<String, Object>) response.rows()[0][0]),
-                is("age=32, birthdate=276912000000, details={job=Mathematician}, gender=female, name=Trillian, race=Human"));
+        Map<String, Object> _doc = new TreeMap<>((Map)response.rows()[0][0]);
+        assertEquals(
+                "{age=32, birthdate=276912000000, details={job=Mathematician}, " +
+                        "gender=female, name=Trillian, race=Human}",
+                _doc.toString());
     }
 
     @Test
